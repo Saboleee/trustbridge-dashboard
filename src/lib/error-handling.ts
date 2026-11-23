@@ -5,7 +5,7 @@
  * Also defines the shared API error JSON shape used across `src/app/api/`
  * route handlers so clients can rely on a single documented envelope:
  *
- *   { "error": { "code": string, "message": string, "details"?: unknown } }
+ *   { "error": { "code": string, "message": string, "details"?: unknown, "correlationId"?: string } }
  *
  * See `docs/error-taxonomy.md` for the full taxonomy.
  */
@@ -154,12 +154,17 @@ export type ApiErrorCode =
 
 /**
  * Shared API error JSON shape emitted by every route handler.
+ *
+ * `correlationId` is the audit correlation id (see `src/lib/audit.ts`) that
+ * support can quote to trace a maintainer mutation. It is optional so
+ * non-mutating handlers and legacy clients remain compatible.
  */
 export interface ApiErrorBody {
   error: {
     code: ApiErrorCode;
     message: string;
     details?: unknown;
+    correlationId?: string;
   };
 }
 
@@ -180,11 +185,15 @@ export const apiErrorStatus: Record<ApiErrorCode, number> = {
 /**
  * Build the shared API error body. Falls back to a stable user-friendly
  * message when none is provided so clients always have something to toast.
+ *
+ * Pass `correlationId` (from `src/lib/audit.ts`) on maintainer mutation
+ * failures so support can trace the request.
  */
 export function createApiError(
   code: ApiErrorCode,
   message?: string,
-  details?: unknown
+  details?: unknown,
+  correlationId?: string
 ): ApiErrorBody {
   const body: ApiErrorBody = {
     error: {
@@ -197,23 +206,43 @@ export function createApiError(
     body.error.details = details;
   }
 
+  if (correlationId) {
+    body.error.correlationId = correlationId;
+  }
+
   return body;
 }
 
 /**
  * Build a JSON `Response` with the shared error envelope and matching status.
  * Route handlers should return this instead of ad-hoc `{ error: string }`.
+ *
+ * When `correlationId` is provided it is echoed both in the JSON body and in
+ * the `X-Correlation-Id` response header so operators can trace the request
+ * even when the body is not surfaced to the user.
  */
 export function apiErrorResponse(
   code: ApiErrorCode,
   message?: string,
   details?: unknown,
-  status?: number
+  status?: number,
+  correlationId?: string
 ): Response {
-  return new Response(JSON.stringify(createApiError(code, message, details)), {
-    status: status ?? apiErrorStatus[code],
-    headers: { 'Content-Type': 'application/json' },
-  });
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+
+  if (correlationId) {
+    headers['X-Correlation-Id'] = correlationId;
+  }
+
+  return new Response(
+    JSON.stringify(createApiError(code, message, details, correlationId)),
+    {
+      status: status ?? apiErrorStatus[code],
+      headers,
+    }
+  );
 }
 
 /**
