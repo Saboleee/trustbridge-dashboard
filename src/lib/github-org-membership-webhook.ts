@@ -38,11 +38,43 @@ export interface ProcessEventResult {
 // ---------------------------------------------------------------------------
 
 /**
+ * Documented GitHub webhook signature algorithms we accept.
+ *
+ * GitHub documents `sha256` (x-hub-signature-256) as the current scheme and
+ * `sha1` (x-hub-signature) as legacy. We only accept `sha256`; anything else
+ * (sha1, md5, unknown, empty) is rejected with a stable reason code.
+ */
+export const ALLOWED_SIGNATURE_ALGORITHMS = ["sha256"] as const;
+export type SignatureAlgorithm = (typeof ALLOWED_SIGNATURE_ALGORITHMS)[number];
+
+/** Maximum accepted length of the raw signature header (scheme + "=" + hex). */
+export const MAX_SIGNATURE_HEADER_LENGTH = 256;
+
+/** Stable reason codes returned by {@link verifyWebhookSignature}. */
+export const WEBHOOK_SIGNATURE_REASONS = {
+  secretMissing: "GITHUB_WEBHOOK_SECRET is not configured",
+  headerMissing: "Missing x-hub-signature-256 header",
+  headerOversized: "Signature header exceeds maximum length",
+  headerMalformed: "Malformed signature header (expected <algorithm>=<hex>)",
+  algorithmUnsupported: "Unsupported signature algorithm (expected sha256)",
+  lengthMismatch: "Signature length mismatch",
+  mismatch: "Signature mismatch",
+} as const;
+
+function isAllowedAlgorithm(scheme: string): scheme is SignatureAlgorithm {
+  return (ALLOWED_SIGNATURE_ALGORITHMS as readonly string[]).includes(scheme);
+}
+
+/**
  * Verify a GitHub webhook HMAC-SHA256 signature.
  *
  * GitHub sends the signature as `sha256=<hex>` in the
  * `x-hub-signature-256` header.  We recompute the HMAC over the raw body
  * and compare with a constant-time equality check to resist timing attacks.
+ *
+ * Only the documented `sha256` algorithm is accepted; weak (`sha1`, `md5`) or
+ * unknown algorithms are rejected with a stable reason code. Malformed,
+ * missing, or oversized headers fail closed.
  *
  * Returns `{ ok: false }` (never throws) so callers can always branch on the
  * result without wrapping in try/catch.
@@ -53,19 +85,37 @@ export function verifyWebhookSignature(
 ): WebhookVerificationResult {
   const secret = process.env.GITHUB_WEBHOOK_SECRET?.trim();
   if (!secret) {
-    return { ok: false, reason: "GITHUB_WEBHOOK_SECRET is not configured" };
+    return { ok: false, reason: WEBHOOK_SIGNATURE_REASONS.secretMissing };
   }
 
   if (!signatureHeader) {
-    return { ok: false, reason: "Missing x-hub-signature-256 header" };
+    return { ok: false, reason: WEBHOOK_SIGNATURE_REASONS.headerMissing };
   }
 
-  const [scheme, receivedHex] = signatureHeader.split("=");
-  if (scheme !== "sha256" || !receivedHex) {
-    return { ok: false, reason: "Unexpected signature scheme (expected sha256=...)" };
+  if (signatureHeader.length > MAX_SIGNATURE_HEADER_LENGTH) {
+    return { ok: false, reason: WEBHOOK_SIGNATURE_REASONS.headerOversized };
   }
 
-  const expectedHex = createHmac("sha256", secret)
+  // Split on the first "=" only; the hex digest never contains "=".
+  const separatorIndex = signatureHeader.indexOf("=");
+  if (separatorIndex <= 0) {
+    return { ok: false, reason: WEBHOOK_SIGNATURE_REASONS.headerMalformed };
+  }
+
+  const scheme = signatureHeader.slice(0, separatorIndex).trim().toLowerCase();
+  const receivedHex = signatureHeader.slice(separatorIndex + 1).trim();
+
+  if (!scheme || !receivedHex) {
+    return { ok: false, reason: WEBHOOK_SIGNATURE_REASONS.headerMalformed };
+  }
+
+  // Enforce the algorithm allowlist BEFORE any HMAC work so weak/unknown
+  // algorithms (sha1, md5, ...) can never be accepted.
+  if (!isAllowedAlgorithm(scheme)) {
+    return { ok: false, reason: WEBHOOK_SIGNATURE_REASONS.algorithmUnsupported };
+  }
+
+  const expectedHex = createHmac(scheme, secret)
     .update(rawBody, "utf8")
     .digest("hex");
 
@@ -77,7 +127,7 @@ export function verifyWebhookSignature(
     receivedHex.length !== expectedHex.length ||
     !/^[0-9a-fA-F]+$/.test(receivedHex)
   ) {
-    return { ok: false, reason: "Signature length mismatch" };
+    return { ok: false, reason: WEBHOOK_SIGNATURE_REASONS.lengthMismatch };
   }
 
   // Use timingSafeEqual to prevent timing-oracle attacks.
@@ -85,7 +135,9 @@ export function verifyWebhookSignature(
   const received = Buffer.from(receivedHex, "hex");
 
   const match = timingSafeEqual(expected, received);
-  return match ? { ok: true } : { ok: false, reason: "Signature mismatch" };
+  return match
+    ? { ok: true }
+    : { ok: false, reason: WEBHOOK_SIGNATURE_REASONS.mismatch };
 }
 
 // ---------------------------------------------------------------------------

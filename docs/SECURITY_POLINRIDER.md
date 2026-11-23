@@ -121,3 +121,34 @@ This tooling **does not** rotate credentials. If malware was confirmed on a mach
 1. Stop using that machine for privileged work.
 2. From a clean device, rotate GitHub, npm, cloud, SSH, wallet, and CI secrets.
 3. Review recent publishes and force-pushes on your accounts.
+
+## Webhook signature algorithm allowlist
+
+The GitHub org-membership webhook (`src/lib/github-org-membership-webhook.ts`) verifies the
+`X-Hub-Signature-256` header using an explicit allowlist of documented GitHub signature
+algorithms. Only **`sha256`** is accepted; weak (`sha1`, `md5`) and unknown algorithms are
+rejected before any HMAC comparison runs.
+
+Stable reason codes returned by the verifier (never silently accepted):
+
+| Reason code | Meaning |
+| --- | --- |
+| `signature_missing` | No `X-Hub-Signature-256` header present |
+| `signature_malformed` | Header not in `sha256=<hex>` form, or non-hex digest |
+| `signature_oversized` | Header exceeds the documented maximum length |
+| `signature_algorithm_unsupported` | Algorithm prefix is not on the allowlist (e.g. `sha1`, `md5`, unknown) |
+| `signature_mismatch` | Well-formed `sha256` signature that does not match the computed HMAC |
+| `secret_missing` | Webhook secret is not configured |
+
+### Secret rotation
+
+When rotating the webhook secret:
+
+1. Generate a new high-entropy secret and store it in the secret manager (never in the repo).
+2. Update the GitHub org webhook configuration to the new secret.
+3. Deploy the new secret to the dashboard environment.
+4. Confirm deliveries succeed (HTTP 2xx) and no `signature_mismatch` reason codes appear in logs.
+5. Revoke the old secret after the overlap window closes.
+
+Signature verification is constant-time and algorithm-pinned; rotating the secret does not
+change the accepted algorithm (`sha256` only).
