@@ -70,6 +70,11 @@ export async function GET() {
  * Toggle a flag in the database source. Requires same-origin (CSRF) and an
  * authenticated maintainer session — the flags API cannot be toggled without
  * auth (issue #661). Body: `{ key: FeatureFlagKey, enabled: boolean }`.
+ *
+ * Percentage rollouts use a sticky bucketing key (see docs/FEATURE_FLAGS.md):
+ * the `userId` is the default sticky key, and `orgId` is used for org-scoped
+ * flags so a user's bucket stays stable across requests and sessions. This
+ * endpoint only toggles the flag; it does not change the sticky key.
  */
 export async function POST(request: NextRequest) {
   const csrf = assertSameOrigin(request);

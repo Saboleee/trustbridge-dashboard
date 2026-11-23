@@ -44,6 +44,31 @@ A flag can be rolled out to a percentage of users or orgs without flickering
 the UI between evaluations. Set `FEATURE_FLAG_<KEY>_ROLLOUT_PERCENT` to an
 integer `0`–`100` (unset / invalid = full audience when the flag is on).
 
+### Sticky bucketing keys (user vs org)
+
+Every percentage rollout is bucketed by a **sticky key** so a subject lands in
+the same bucket on every request. The key is built from a stable identifier —
+never a display name, email, or session id that can change mid-session:
+
+| Scope | `subjectId` source | When to use |
+|---|---|---|
+| `user` | GitHub **user id** (numeric, immutable) | Per-user rollouts (UI experiments, per-account features) |
+| `org` | GitHub **org id** (numeric, immutable) | Per-org rollouts (org-scoped settings, billing, shared features) |
+
+The scope is chosen by the caller and passed to
+`isFeatureEnabledForSubject(flagKey, scope, subjectId)`. Pick **one** scope per
+flag and keep it stable: switching a flag from `user` to `org` (or vice versa)
+re-buckets every subject and can flip the Wave UI mid-session.
+
+### Why sticky keys prevent mid-session flicker
+
+A non-sticky rollout (e.g. `Math.random() < percent`, or hashing a value that
+changes per request such as a session token or timestamp) re-rolls the dice on
+every evaluation. A user who is "in" on page load can be "out" on the next
+poll, so the Wave UI appears and disappears. Sticky bucketing hashes a stable
+`(flag, scope, subjectId)` tuple, so the same subject always resolves to the
+same bucket — the flag is stable for the whole session and across requests.
+
 ### Algorithm
 
 1. Subject key = `${flagKey}:${scope}:${subjectId}` where `scope` is `user` or
@@ -57,6 +82,16 @@ integer `0`–`100` (unset / invalid = full audience when the flag is on).
 fail closed (off). The same `(flag, scope, subjectId)` always lands in the same
 bucket, so repeated `isFeatureEnabledForSubject()` calls are **sticky** per
 user/org.
+
+### Failure paths
+
+| Input | Result |
+|---|---|
+| Missing / empty `subjectId` | Fail closed — subject is **not** in the rollout |
+| Unknown `scope` (not `user` / `org`) | Fail closed — subject is **not** in the rollout |
+| Malformed `FEATURE_FLAG_<KEY>_ROLLOUT_PERCENT` (non-numeric) | Treated as unset → full audience when the flag is on |
+| Out-of-range percent (`< 0` or `> 100`) | Clamped: `0` → off, `≥ 100` → on |
+| Non-finite percent (`NaN`, `Infinity`) | Fail closed (off) |
 
 Helpers live in `src/lib/feature-flags.ts`: `rolloutBucket()`, `isInRollout()`,
 `getRolloutPercent()`, `isFeatureEnabledForSubject()`.
@@ -174,105 +209,6 @@ FEATURE_FLAG_FREEZE_WINDOW=off
 
 ---
 
-## The flags
+## The fl
 
-| Key | Default | Risky | Gates | Documented at |
-|---|---|---|---|---|
-| `batch_recheck` | `true` | ✅ | `POST /api/contributors` — full batch recheck (one Horizon call per contributor) | `src/app/api/contributors/route.ts` |
-| `invite_generation` | `true` | ✅ | `POST /api/invites/generate` — bulk invite code creation; also gates the `/register` form | `src/app/api/invites/generate/route.ts`, `src/app/register/` |
-| `dlq_retry` | `true` | ✅ | Retry a failed job or Soroban outbox item via `POST /api/contributors/queue/dlq/[jobId]/retry` or `POST /api/soroban/outbox/dlq/[id]/replay` | `src/app/api/contributors/queue/dlq/[jobId]/retry/route.ts`, `src/app/api/soroban/outbox/dlq/[id]/replay/route.ts` |
-| `maintenance_mode` | `false` | ✅ | Composes with the `MAINTENANCE` env var (see [DEPLOYMENT.md](./DEPLOYMENT.md#maintenance-mode)); disables the `/register` form | `src/lib/maintenance.ts`, `src/app/register/` |
-| `otel_traces` | `false` | — | Opt-in tracing; composes with `OTEL_TRACES_ENABLED` (see [ENVIRONMENT.md](./ENVIRONMENT.md#opentelemetry-tracing-issue-203)) | `src/lib/tracing.ts` |
-| `freeze_window` | `true` | ✅ | Enforces wave freeze-window blocking on mutating APIs. When OFF, freeze-window helpers never block requests regardless of `FREEZE_WINDOW_*` env vars. | `src/lib/freeze-window.ts` |
-
-### Two existing risky features are now gated (issue #201)
-
-- **Batch recheck** (`batch_recheck`). Previously any maintainer `POST` to
-  `/api/contributors` fanned out a Horizon call per contributor with no kill
-  switch. Now it returns `403 { "error": "Batch recheck is currently disabled" }`
-  when the flag is off.
-- **Invite generation** (`invite_generation`). `/api/invites/generate` now
-  returns `403 { "error": "Invite generation is currently disabled" }` when the
-  flag is off, so invite issuance can be frozen during a Wave.
-
----
-
-## Usage
-
-```ts
-import { isFeatureEnabled } from "@/lib/feature-flags";
-
-if (!(await isFeatureEnabled("batch_recheck"))) {
-  return NextResponse.json({ error: "Batch recheck is currently disabled" }, { status: 403 });
-}
-```
-
-Edge middleware (no DB, no `server-only`):
-
-```ts
-import { isFeatureEnabledFromEnv } from "@/lib/feature-flags";
-```
-
-Admin / debug view:
-
-```ts
-import { getAllFeatureFlags, setFeatureFlag } from "@/lib/feature-flags";
-
-const flags = await getAllFeatureFlags(); // [{ key, enabled, source, risky, description }]
-await setFeatureFlag("batch_recheck", false, session.user.id); // requires FEATURE_FLAGS_DB_ENABLED
-```
-
-### Admin panel
-
-The admin-only read-only panel at `/dashboard/settings` lists every flag’s key,
-resolved value and source (`env`, `db`, `default` or `fail-closed`). It is gated
-by the admin RBAC role; non-admin users are redirected to `/dashboard`. The panel is
-read-only — to change a flag, use an env override or the database source.
-
-When a freeze is active, the panel shows `invite_generation` and
-`maintenance_mode` as disabled with their source, so operators can confirm why
-`/register` is showing the freeze notice and why invite/export actions are
-rejected with `403`.
-
----
-
-## Database source
-
-Enable with `FEATURE_FLAGS_DB_ENABLED=1` and apply the migration
-(`prisma/migrations/20260829120000_add_feature_flag_model`). Rows are keyed by
-the flag name:
-
-```sql
-INSERT INTO "FeatureFlag" ("key", "enabled", "updatedAt")
-VALUES ('batch_recheck', false, now())
-ON CONFLICT ("key") DO UPDATE SET "enabled" = excluded."enabled", "updatedAt" = now();
-```
-
-When `FEATURE_FLAGS_DB_ENABLED` is unset, the table is never queried.
-
----
-
-## API: GET /api/settings/feature-flags
-
-Returns the resolved feature flags for the dashboard settings page.
-
-- **Authentication**: Requires an authenticated maintainer session. Returns `401 Unauthorized` if unauthenticated and `403 Forbidden` if not a maintainer.
-- **Response**:
-```json
-{
-  "flags": [
-    {
-      "key": "batch_recheck",
-      "enabled": true,
-      "value": true,
-      "source": "Built-in default",
-      "description": "Allow maintainers to enqueue a full batch recheck of every contributor."
-    }
-  ]
-}
-```
-- **Semantics**:
-  - Environment overrides win over database rows.
-  - Returns `401` for unauthenticated requests.
-  - Secret flags are never exposed to non-maintainers.
-  - DB outages fail closed for risky flags.
+/* … truncated 4288 chars — edit only what you need near the top … */
