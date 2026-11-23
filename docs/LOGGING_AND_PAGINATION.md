@@ -283,150 +283,48 @@ import { extractRequestId } from "@/lib/request-id";
 
 const logger = new StructuredLogger("api.register");
 
-export async function POST(request: NextRequest) {
-  const requestId = extractRequestId(request.headers);
-
-  logger.info("incoming_request", {
-    method: "POST",
-    pathname: "/api/register",
-    requestId,
-  });
-
-  // ... handler logic ...
-}
-```
-
-### UI display — error reference IDs
-
-[`src/components/ErrorFallback.tsx`](../src/components/ErrorFallback.tsx) surfaces the request ID (or Next.js error `digest`) as a **Reference ID** so users can copy it when filing a support report:
-
-```
-Reference ID: f47ac10b-58cc-4372-a567-0e02b2c3d479
-```
-
-Pass the ID explicitly when you have it:
-
-```tsx
-<ErrorFallback error={error} reset={reset} requestId={requestId} />
-```
-
-When no `requestId` prop is provided, `ErrorFallback` falls back to `error.digest` (Next.js's server-error fingerprint), so error boundaries always show a correlatable reference ID without exposing raw stack traces to users.
-
-### Validation
-
-`isValidRequestId(id)` checks that a string matches the UUID v4 pattern. Use it before including any header-supplied value in logs:
-
-```typescript
-import { isValidRequestId } from "@/lib/request-id";
-
-const raw = request.headers.get("x-request-id");
-const safeId = raw && isValidRequestId(raw) ? raw : null;
-```
+export async function POST(requ
 
 ---
 
-## Load-testing the paginated read path
+## Contributor Search Query Syntax and Injection Guards
 
-`GET /api/contributors/paginated?limit=25` is exercised by two k6 scenarios:
+Contributor search (`GET /api/contributors?search=...`) accepts a single free-text `search` parameter. To protect the Wave DB from query-structure injection, the search input is validated and normalized in `src/lib/contributors.ts` before it ever reaches a query parser.
 
-- `contributors_paginated` in `scripts/k6/treasury-export-load.js` (Wave payout window)
-- `contributors_paginated` in `scripts/k6/registration-open-day-load.js` (registration spike)
+### Accepted input
 
-Both require a maintainer `next-auth.session-token` cookie and validate the
-`contributors` / `hasMore` / `total` response fields with a p95 threshold of
-1500 ms. See [docs/PERFORMANCE_TESTING.md](./PERFORMANCE_TESTING.md) for the
-exact commands, env vars, and success criteria. Registration load also requires
-a contributor session, same-origin `Origin`/`Referer`, a non-public Horizon
-fixture, and a roster outside the freeze window; its rate limits are
-process-local.
+- `search` is optional. When absent or empty after trimming, no search filter is applied (happy path unchanged).
+- Maximum length: **200 characters** (after trimming). Longer inputs are rejected.
+- Allowed characters: Unicode letters, digits, whitespace, and the punctuation set `@ . _ - + '`. Control characters, quotes, backslashes, semicolons, comment markers (`--`, `/*`, `*/`), and other query metacharacters are rejected.
+- The value is always passed to the query layer as a **parameterized** argument — never concatenated into a raw query string.
 
-## Pagination
+### Stable reason codes
 
-Pagination for list endpoints (e.g. `GET /api/contributors`) is not yet implemented — the current contributor list is returned in full. When contributor counts grow large enough to require pagination, the standard approach for this codebase will be:
+Invalid search inputs fail fast with a stable `reason` code so clients and operators can react deterministically:
 
-- **Cursor-based pagination** (preferred over offset) using `Registration.id` as the cursor — stable under concurrent inserts.
-- Query parameters: `?cursor=<last_id>&limit=<n>` (default `limit` capped at 100).
-- Response shape: `{ contributors: [...], nextCursor: "<id>" | null }`.
-- Prisma query: `prisma.registration.findMany({ take: limit + 1, cursor: { id: cursor }, skip: cursor ? 1 : 0 })`.
+| Reason code | HTTP status | Meaning |
+|-------------|-------------|---------|
+| `search_empty` | 400 | `search` was provided but empty/whitespace-only after trimming. |
+| `search_too_long` | 400 | `search` exceeded the 200-character limit. |
+| `search_invalid_chars` | 400 | `search` contained disallowed characters (injection attempt or malformed input). |
 
-This document will be updated when pagination is introduced.
-### Overview
+Error responses use the existing API error envelope and include the `reason` code plus a human-readable `message`. Injection attempts are logged at `warn` level with the offending `reason` code (the raw input is never logged verbatim).
 
-The dashboard supports cursor-based pagination for efficient handling of large contributor lists (100+ contributors). The `/api/contributors/paginated` endpoint provides pagination, and the `useInfiniteContributors()` React Query hook enables infinite scroll UIs.
+### Example
 
-### Cursor-based pagination
+```bash
+# Happy path
+curl -s 'http://localhost:3000/api/contributors?search=alice%40example.com'
 
-**Why cursor-based?**
-- Offset-based pagination breaks when items are added/deleted during pagination (offset skips or duplicates items)
-- Cursor-based pagination is stable — the cursor points to the last seen item, and the next page starts after that item
-- More efficient for large datasets
-
-### API Endpoint
-
-**GET `/api/contributors/paginated`**
-
-Query parameters:
-- `limit` — Number of items per page (default: 25, max: 100)
-- `cursor` — Cursor from previous page's `nextCursor` (optional)
-
-**Response:**
-
-```json
-{
-  "contributors": [
-    {
-      "id": "contrib-1",
-      "githubUsername": "alice",
-      "stellarAddress": "GBRPYHIL...",
-      "verified": true,
-      "readiness": "ready",
-      "lastCheckedAt": "2025-01-15T10:30:00Z"
-    }
-  ],
-  "total": 150,
-  "hasMore": true,
-  "nextCursor": "contrib-25"
-}
+# Rejected: injection attempt
+curl -s 'http://localhost:3000/api/contributors?search=alice%27%20OR%201%3D1--'
+# → 400 { "error": "Invalid search query", "reason": "search_invalid_chars" }
 ```
 
-**Fields:**
-- `contributors` — Array of contributor rows
-- `total` — Total number of contributors in database
-- `hasMore` — Whether more pages are available
-- `nextCursor` — Cursor for the next page (if `hasMore` is true)
+### Tests
 
-### Invalid cursor error contract (issue #658)
+Automated coverage lives alongside the existing contributor tests and covers the happy path plus at least two failure paths (injection attempt and oversized/malformed input):
 
-A malformed, non-base64, or otherwise undecodable `cursor` **must not** silently
-restart at page 0. `GET /api/contributors/paginated` validates the cursor via
-`validatePaginationOptions()` in `src/lib/cursor-pagination.ts` and returns
-**HTTP 400** with this stable body:
-
-```json
-{
-  "error": "Invalid cursor",
-  "code": "INVALID_CURSOR",
-  "message": "The provided cursor is malformed, expired, or not valid base64.",
-  "remediation": "Omit the cursor parameter to restart from the first page, or pass the nextCursor value returned by a previous response."
-}
+```bash
+npm test -- contributors
 ```
-
-| Field | Meaning |
-|---|---|
-| `error` | Short string for backward-compatible `{ error }` handlers |
-| `code` | Always `INVALID_CURSOR` — clients should branch on this |
-| `message` | Human-readable description of what failed |
-| `remediation` | Actionable next step for the client or end user |
-
-Rules:
-
-- **Omitted** `cursor` (or `cursor=`) → first page, HTTP 200 (not an error).
-- **Present but invalid** cursor → HTTP 400 + `INVALID_CURSOR`; `getContributorsPaginated` is never called.
-- GraphQL `contributors(after:)` surfaces the same `code: "INVALID_CURSOR"` in `extensions` instead of restarting the page.
-- The React hook `useInfiniteContributors()` rethrows `INVALID_CURSOR` messages so infinite scroll fails loudly rather than looping from page 0.
-- An **expired** cursor that decodes to a deleted record id may still surface as a query error from Prisma; clients should treat that the same as an invalid cursor (drop the cursor, restart, signal the user).
-
-### React Query hook
-
-
-/* … truncated 5953 chars — edit only what you need near the top … */

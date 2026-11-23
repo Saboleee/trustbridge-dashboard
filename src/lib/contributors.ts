@@ -57,6 +57,92 @@ export function filterContributors(
   return [...contributors];
 }
 
+// ── Search injection guards (#777) ──────────────────────────────────────────
+//
+// Contributor search input is untrusted. Before it reaches any query parser
+// (Prisma `where`, raw SQL fragments, or the in-memory matcher below) it is
+// validated and normalized so it can never alter query structure. The guards
+// are pure and deterministic so the API route and the UI share one contract.
+//
+// Documented reason codes (stable — do not rename without a docs update):
+//   SEARCH_EMPTY      — query is empty/whitespace only (callers treat as "no filter")
+//   SEARCH_TOO_LONG   — query exceeds CONTRIBUTOR_SEARCH_MAX_LENGTH characters
+//   SEARCH_INVALID    — query contains characters outside the allowlist
+//                       (control chars, quotes, comment markers, etc.)
+
+/** Maximum accepted length of a raw contributor search query. */
+export const CONTRIBUTOR_SEARCH_MAX_LENGTH = 128;
+
+/** Stable reason codes returned by {@link validateContributorSearch}. */
+export type ContributorSearchErrorCode =
+  | "SEARCH_EMPTY"
+  | "SEARCH_TOO_LONG"
+  | "SEARCH_INVALID";
+
+/**
+ * Allowlist for search input: letters, digits, and the punctuation that can
+ * legitimately appear in GitHub usernames or Stellar addresses (`@`, `-`, `_`,
+ * `.`, `*`). Everything else — quotes, semicolons, backslashes, comment
+ * markers, control characters — is rejected rather than stripped so callers
+ * get a stable, documented failure instead of silent success.
+ */
+const CONTRIBUTOR_SEARCH_ALLOWED = /^[A-Za-z0-9@._*-]+$/;
+
+/** Characters that are always rejected even if they slip past the allowlist. */
+const CONTRIBUTOR_SEARCH_FORBIDDEN = /[\u0000-\u001f\u007f'"`;\\]/;
+
+export type ContributorSearchValidation =
+  | { ok: true; query: string }
+  | { ok: false; code: ContributorSearchErrorCode; message: string };
+
+/**
+ * Validates and normalizes a raw contributor search query.
+ *
+ * Returns `{ ok: true, query }` with a trimmed, length-bounded value that is
+ * safe to pass to a query parser, or `{ ok: false, code, message }` with a
+ * stable reason code. An empty query is reported as `SEARCH_EMPTY` so callers
+ * can decide whether that means "no filter" (the UI) or a 400 (the API).
+ */
+export function validateContributorSearch(
+  raw: unknown,
+): ContributorSearchValidation {
+  if (raw === undefined || raw === null) {
+    return { ok: false, code: "SEARCH_EMPTY", message: "Search query is empty." };
+  }
+  if (typeof raw !== "string") {
+    return {
+      ok: false,
+      code: "SEARCH_INVALID",
+      message: "Search query must be a string.",
+    };
+  }
+
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, code: "SEARCH_EMPTY", message: "Search query is empty." };
+  }
+  if (trimmed.length > CONTRIBUTOR_SEARCH_MAX_LENGTH) {
+    return {
+      ok: false,
+      code: "SEARCH_TOO_LONG",
+      message: `Search query must be at most ${CONTRIBUTOR_SEARCH_MAX_LENGTH} characters.`,
+    };
+  }
+  if (
+    CONTRIBUTOR_SEARCH_FORBIDDEN.test(trimmed) ||
+    !CONTRIBUTOR_SEARCH_ALLOWED.test(trimmed)
+  ) {
+    return {
+      ok: false,
+      code: "SEARCH_INVALID",
+      message:
+        "Search query contains unsupported characters. Use letters, digits, and @ . _ - * only.",
+    };
+  }
+
+  return { ok: true, query: trimmed };
+}
+
 /**
  * Normalizes contributor search values so matching is resilient to case,
  * whitespace, leading @ symbols, and punctuation-heavy addresses.
@@ -117,13 +203,23 @@ function fuzzyMatches(value: string, query: string): boolean {
 /**
  * Search contributors by GitHub username or Stellar address.
  * Performs case-insensitive matching and tolerates small typing errors.
+ *
+ * The query is validated through {@link validateContributorSearch} first; an
+ * empty query returns all contributors (no filter), while an oversized or
+ * malformed query throws a `ContributorSearchError` carrying a stable reason
+ * code so callers never silently succeed on rejected input.
  */
 export function searchContributors(
   contributors: ContributorRow[],
   query: string,
 ): ContributorRow[] {
-  const q = query.trim();
-  if (!q) return contributors;
+  const validation = validateContributorSearch(query);
+  if (!validation.ok) {
+    if (validation.code === "SEARCH_EMPTY") return contributors;
+    throw new ContributorSearchError(validation.code, validation.message);
+  }
+
+  const q = validation.query;
 
   return contributors.filter((row) => {
     const githubUsername = row.githubUsername ?? "";
@@ -136,6 +232,17 @@ export function searchContributors(
       stellarAddress.toLowerCase().includes(q.toLowerCase())
     );
   });
+}
+
+/** Error thrown when a contributor search query fails validation. */
+export class ContributorSearchError extends Error {
+  readonly code: ContributorSearchErrorCode;
+
+  constructor(code: ContributorSearchErrorCode, message: string) {
+    super(message);
+    this.name = "ContributorSearchError";
+    this.code = code;
+  }
 }
 
 export function compareContributors(
